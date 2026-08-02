@@ -2,6 +2,7 @@
 # Gather non-root device / kernel info for an OnePlus device. No root required.
 # Prints adb-readable values + a manual "Settings -> About phone" checklist.
 # Optionally compares the device's running kernel to a target version.
+# Works on any OnePlus (generic); VERIFIED END-TO-END ONLY ON THE ONEPLUS ACE 3.
 #
 # Usage:
 #   bash gather_device_info.sh [<device-serial>] [--target-version 5.15.207]

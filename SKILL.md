@@ -33,6 +33,14 @@ rules, and pitfalls live in `references/oneplus_resukisu.md`; the reusable helpe
 > Lunaris-AOSP. For other OnePlus models, re-confirm the kernel version, manifest file, branch,
 > `_v_`/`_b_` Android line, and A/B slot device paths before flashing.
 
+## When to use
+
+Trigger this skill whenever the user mentions any of: compiling a ReSukiSU / KernelSU-family kernel
+for a OnePlus, integrating ReSukiSU into a OnePlus / Oplus kernel source, flashing a ReSukiSU-enabled
+kernel to test it, registering a (compatible) manager, or verifying ReSukiSU root. ReSukiSU is the
+manager-agnostic KernelSU-family choice — use it when the user does not want to be locked to
+`com.rifsxd.ksunext` (that is the KSU Next skill's constraint).
+
 ## What is ReSukiSU
 
 ReSukiSU is a **KernelSU-family** root solution — the `su` implementation lives in the kernel, not in
@@ -45,6 +53,19 @@ a boot ramdisk patch (no Magisk involved). Key facts that drive this skill:
   the main difference from KSU Next (`com.rifsxd.ksunext`).
 - Integration is via a `setup.sh` (same pattern as KernelSU), plus defconfig flags.
 - Supports **Manual Hook** and **SUSFS** modes; supports a wide kernel range (GKI and non-GKI).
+
+### ReSukiSU vs the other KernelSU-family managers
+
+| | ReSukiSU (this skill) | KSU Next (`com.rifsxd.ksunext`) | Official KSU (`me.weishu.kernelsu`) |
+|---|---|---|---|
+| Manager package | **Any compatible** (Official KSU / RKSU / MKSU / ReSukiSU mgr) | `com.rifsxd.ksunext` **only** | `me.weishu.kernelsu` |
+| Kernel module | ReSukiSU (KernelSU-family fork) | KSU Next (rifsxd fork) | upstream KernelSU |
+| Interop | Crowns whichever manager APK is installed & opened once | Only `com.rifsxd.ksunext` registers | incompatible with KSU Next / ReSukiSU kernels |
+
+The kernel "crowns" exactly one manager APK (matched by a magic in the APK). With a ReSukiSU kernel,
+**any** compatible manager works — installing and launching it yields `Crowning manager:
+<package>(uid=...)` and root becomes available. This is the main behavioral difference from KSU
+Next, which is locked to `com.rifsxd.ksunext`.
 
 ## Mental model (important)
 

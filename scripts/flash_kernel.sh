@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Flash a ReSukiSU kernel to a OnePlus device.
+# VERIFIED END-TO-END ONLY ON THE ONEPLUS ACE 3; other models may use different
+# partition names / slot rules.
 #
 # Modes:
 #   - raw boot.img  -> fastboot flash boot  (slot-aware)

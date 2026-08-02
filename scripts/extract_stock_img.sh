@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Extract stock boot / vendor_boot images from a full OTA zip (payload.bin).
 # Keeps known-good images for fastboot rollback if a custom kernel fails to boot.
+# Works for any OnePlus (Oplus) GKI ROM that ships payload.bin.
 #
 # Requires: unzip, and payload-dumper-go
 #   install payload-dumper-go:  go install github.com/ssut/payload-dumper-go@latest
