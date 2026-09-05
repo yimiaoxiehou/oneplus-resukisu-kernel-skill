@@ -6,15 +6,16 @@ description: >-
   ReSukiSU into a OnePlus / Oplus GKI kernel source tree, or flash a ReSukiSU-enabled kernel to test
   it. Correct framing: start from a NO-ROOT device — gather kernel/device info with a non-root
   `adb shell` plus a manual Settings check, then sync the matching source tree (the kernel version
-  MUST equal the device's running kernel), integrate ReSukiSU, compile with the prebuilt clang via a
+  MUST equal the device's running kernel), integrate ReSukiSU, compile with a modern clang behind a version-faking wrapper + kCFI (matching the OEM vendor modules) via a
   direct `make` flow, and flash via fastboot or a custom recovery to test. Root only becomes
   available AFTER the ReSukiSU kernel is flashed and a compatible manager (Official KernelSU
   `me.weishu.kernelsu`, RKSU, MKSU, or the ReSukiSU manager) is installed and opened once. Encodes
   the hard-won pitfalls: ReSukiSU is manager-agnostic, the kernel VERSION MUST match the device or
-  it will not boot, LTO=thin is required when RAM < 24GB, and you must match the device's SoC
+  it will not boot, LTO=thin is required when RAM < 24GB, kCFI must be enabled AND the clang/CFI build
+  environment must match the OEM vendor modules, and you must match the device's SoC
   platform AND the Android `_v_`/`_b_` line. NOTE: the concrete device values (manifest, branch,
   build layout, slot rules) were verified against the OnePlus Ace 3 (PJE110 / sm8550 / kernel
-  5.15.207 / Android 16, running Lunaris-AOSP). The build path (sync + integrate + compile + pack)
+  5.15.207 / Android 16, running Lunaris-AOSP or stock OnePlus Android 16). The build path (sync + integrate + compile + pack)
   and the verify/flash tooling are scripted and validated; full flash+root requires a version-matched
   tree (see the version gate below).
 ---
@@ -189,8 +190,9 @@ rollback.)
 ### 5. Flash
 
 ```bash
-# RAM-test first (no flash) — validates kernel + ReSukiSU without touching partitions:
-bash scripts/flash_kernel.sh [<device-serial>] <boot.img> --boot-test
+# Flash to the active slot's boot_a. NOTE: `fastboot boot` (RAM test) is NON-FUNCTIONAL on this
+# bootloader (it boots the slot kernel, ignoring the temp image) — so flash for real:
+bash scripts/flash_kernel.sh [<device-serial>] <boot.img>
 
 # Flash for real (raw boot.img):
 bash scripts/flash_kernel.sh [<device-serial>] <boot.img>
@@ -203,10 +205,10 @@ ksud install ReSukiSU-Ace3.zip
 On A/B, flashing the active slot's boot; if it fails to boot, restore the stock `boot.img` or
 `fastboot set_active <other_slot>`.
 
-> 🚨 **Ace 3 / Lunaris slot rule (verified):** do NOT `fastboot --slot b flash boot` + `set_active b`
-> on this device — the `_b` slot's `init_boot`/`vendor_boot` are stale and a correct kernel
-> bootloops. Use `fastboot boot <img>` (RAM test) first, then flash `_a` only. The flash script
-> refuses `_b` unless you type `YES`.
+> 🚨 **Ace 3 slot rule (verified):** do NOT `fastboot --slot b flash boot` + `set_active b` unless
+> `_b`'s `init_boot`/`vendor_boot` also match the kernel (flash `_a` only — its `vendor_boot` already
+> matches). And **`fastboot boot <img>` does NOT work** on this bootloader — it reports "Booting OKAY" but
+> boots the slot kernel, so there is no RAM test. Validate by flashing `_a` and checking `uname -r`.
 
 ### 6. Install & crown the manager (after the ReSukiSU kernel boots)
 
@@ -239,10 +241,11 @@ Keep a stock `boot.img` before flashing. Restore with `fastboot flash boot <stoc
   enforces (1) via its version gate and prints (2) before packing. Never trust the manifest name,
   the branch name, or build-script intent — a build shipped `5.15.180-ReSukiSU` for a `5.15.207`
   device precisely because only the intent was checked.
-- **Pin the version string explicitly**, do not rely on scmversion:
-  `CONFIG_LOCALVERSION="-ReSukiSU"` + `# CONFIG_LOCALVERSION_AUTO is not set` +
-  the build script neutralizes `scripts/setlocalversion` so no `-dirty`/`+` is appended.
-  Confirm via `out/include/generated/utsrelease.h` before the link step (the script prints it).
+- **Pin the version string to EXACTLY the device's `uname -r`, INCLUDING `-dirty`.** Do NOT use a
+  vanity LOCALVERSION like `-ReSukiSU` — it yields `5.15.207-ReSukiSU`, which does NOT match and the
+  device will not boot. Set `CONFIG_LOCALVERSION` to the exact `uname -r` suffix (e.g.
+  `-g80a299579459-dirty`) with `# CONFIG_LOCALVERSION_AUTO is not set`. The build script auto-detects
+  `uname -r` from the device, hard-pins it, and ABORTS if the built banner does not match.
 - ReSukiSU is a **KernelSU-family kernel root**; the default flow is **no-root → flash**; root
   appears only after the ReSukiSU kernel boots and a compatible manager is crowned.
 - ReSukiSU is **manager-agnostic** — Official KernelSU, RKSU, MKSU, and the ReSukiSU manager all
@@ -254,6 +257,11 @@ Keep a stock `boot.img` before flashing. Restore with `fastboot flash boot <stoc
   `manual_hook_check.mk`. The **default GKI hook** (just `CONFIG_KSU=y`) works on GKI 2.0 with no
   extra patching — that is what this skill builds by default.
 - **`LTO=thin` is mandatory when host RAM < 24 GB** (full LTO OOMs on the OnePlus GKI build).
+- **kCFI + a clang version-faking wrapper are REQUIRED to match the OEM vendor modules.** Build with
+  `CONFIG_CFI_CLANG=y` and a `clang` wrapper whose `--version` echoes the device's exact OEM
+  `clang version ...` string (read it from `adb shell cat /proc/version`). The tree's prebuilt clang-14
+  WITHOUT CFI will 'boot' but its modules fail to load (CFI/vermagic mismatch) and it falls back to the
+  other slot. A modern real clang (e.g. Neutron clang-23) behind the wrapper is the proven combo.
 - The OnePlus GKI build needs out-of-CI tweaks (disable `-dirty`/scmversion git checks) or the
   version drifts; `build_oneplus_resukisu.sh` applies them.
 - **Match BOTH the SoC platform AND the Android `_v_`/`_b_` line** of the source to the device, or
@@ -267,9 +275,10 @@ Keep a stock `boot.img` before flashing. Restore with `fastboot flash boot <stoc
   `init_boot` / `vendor_boot` are stale (dtb / early-ramdisk do not match the `5.15.207` kernel),
   so even a correct custom boot image bootloops back to fastboot. (The `_a` slot is fine because
   its `init_boot`/`vendor_boot` already match.)
-- **Verify a custom kernel with `fastboot boot <img>` (RAM test, no flash) first.** It boots once
-  using the running slot's `init_boot`/`vendor_boot`, so it validates the kernel + ReSukiSU without
-  touching any partition. Confirm `uname -r`, `su -c id -Z` → `u:r:ksu:s0`, and the Crowning dmesg.
+- **`fastboot boot <img>` does NOT work on this bootloader.** It reports "Booting OKAY" but then
+  boots the slot's existing kernel (the temp image is ignored) — there is no reliable RAM test via
+  fastboot. Validate instead by flashing `boot_a` (keep `_b` as fallback) and checking `uname -r`
+  matches the built banner; root shows via `su -c id -Z` → `u:r:ksu:s0` after a manager is crowned.
 - **To deploy ReSukiSU onto a slot for real**, flash `_a` (the slot whose `init_boot`/`vendor_boot`
   match), NOT `_b`. Doing so replaces the current daily kernel (KSU Next on `_a`) — only do this when
   the user explicitly agrees to overwrite the daily system. If `_b` must ever be used, first flash

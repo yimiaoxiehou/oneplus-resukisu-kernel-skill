@@ -78,8 +78,13 @@ If `SUBLEVEL` does not match the device, **stop** — do not build.
 
 | Device is running | Source tree | Kernel |
 |---|---|---|
-| Stock OxygenOS | `OnePlusOSS/kernel_manifest` @ `oneplus/sm8550`, `oneplus_ace3_b.xml` | `5.15.180` |
-| **Lunaris-AOSP (this device)** | **`OnePlus12R-development/android_kernel_oneplus_sm8550` @ `sixteen-qpr2`** | **`5.15.207` @ `80a299579`** |
+| Stock OxygenOS (official OnePlus manifest build) | `OnePlusOSS/kernel_manifest` @ `oneplus/sm8550`, `oneplus_ace3_b.xml` | `5.15.180` |
+| **Lunaris-AOSP OR stock OnePlus Android 16 (this device, build `2026081804`)** | **`OnePlus12R-development/android_kernel_oneplus_sm8550` @ `sixteen-qpr2`** | **`5.15.207` @ `80a299579`** |
+
+> ⚠️ This device currently runs **stock OnePlus Android 16** whose kernel is
+> `5.15.207-g80a299579459-dirty` — the SAME version the Lunaris-AOSP tree produces. So the
+> `OnePlus12R-development` 5.15.207 tree is the correct source for BOTH ROMs. (The official
+> OnePlus `oneplus_ace3_b.xml` manifest yields 5.15.180 and is only for a stock-OOS device.)
 
 > The custom-ROM tree for 5.15.207 is a plain kernel tree in the `OnePlus12R-development` repo.
 > `build_oneplus_resukisu.sh` expects the **`kernel_platform/common` + `kernel_platform/prebuilts`
@@ -89,30 +94,36 @@ If `SUBLEVEL` does not match the device, **stop** — do not build.
 > paths in the script. The version gate protects you either way: build aborts if `Makefile` SUBLEVEL
 > ≠ `--target-version`.
 
-### Pinning the version string (mandatory)
+### Pinning the version string (mandatory — pin EXACTLY `uname -r`, INCLUDING `-dirty`)
 
-Do not rely on `CONFIG_LOCALVERSION_AUTO` — a locally patched tree is `dirty`, which appends
-`-dirty` and breaks the match. Pin it explicitly:
+The built kernel's `UTS_RELEASE` MUST equal the device's `uname -r` **exactly**, including the
+`-g<sha>` and `-dirty` suffix (e.g. `5.15.207-g80a299579459-dirty`). A mismatch — even just a
+dropped `-dirty` — makes every `vendor_dlkm` module refuse to load and the device will not boot.
+
+**Do NOT use a vanity `LOCALVERSION` like `-ReSukiSU`.** That yields `5.15.207-ReSukiSU`, which
+does NOT match the device and will not boot. Instead pin `LOCALVERSION` to the **exact suffix of
+`uname -r`** (everything after the first `-`) and turn `LOCALVERSION_AUTO` off:
 
 ```
-# in .config
-CONFIG_LOCALVERSION="-ReSukiSU"       # fixed tag; the -g<sha> suffix is dropped
+# in .config   (suffix = "5.15.207-g80a299579459-dirty" -> LOCALVERSION="-g80a299579459-dirty")
+CONFIG_LOCALVERSION="-g80a299579459-dirty"
 # CONFIG_LOCALVERSION_AUTO is not set
 ```
 
-`build_oneplus_resukisu.sh` does this via `scripts/config` and additionally neutralizes
-`scripts/setlocalversion` (replacing the `scm_version` body with empty) so no `-dirty` or bare `+`
-is appended. Confirm **before** linking:
+`build_oneplus_resukisu.sh` auto-detects the exact `uname -r` from the device, sets `LOCALVERSION`
+to the precise suffix, neutralizes `scripts/setlocalversion` (so no stray `-dirty`/`+` is appended),
+and **aborts the build if the produced banner does not equal the device `uname -r`**. Confirm before
+linking:
 
 ```bash
-cat out/include/generated/utsrelease.h   # -> #define UTS_RELEASE "5.15.207-ReSukiSU"
+cat out/include/generated/utsrelease.h   # -> #define UTS_RELEASE "5.15.207-g80a299579459-dirty"
 ```
 
 Then confirm the **built artifact** banner before packing:
 
 ```bash
 strings -a out/arch/arm64/boot/Image | grep -m1 "Linux version"
-# must equal adb shell uname -r (modulo the -ReSukiSU tag)
+# must equal: adb shell uname -r   (e.g. 5.15.207-g80a299579459-dirty)
 ```
 
 ## OnePlus GKI source: manifest + branch mapping
@@ -164,22 +175,38 @@ repo sync -c -j"$(nproc)" --no-clone-bundle --no-tags --force-sync
 ## Build recipe (direct `make` flow — what `build_oneplus_resukisu.sh` does)
 
 The skill does **NOT** use the oplus CI wrapper (`oplus_build_kernel.sh`). Instead it builds the GKI
-`Image` with a direct `make` invocation using the manifest tree's **prebuilt clang** — this sidesteps
-the wrapper's brittle out-of-CI assumptions (strict `check_defconfig`, KMI/ABI monitoring, forced
-`-dirty` scmversion). The tree still ships its own toolchain under `kernel_platform/prebuilts/`,
-so no system Clang is needed.
+`Image` with a direct `make` invocation. **Critical:** the OEM's `vendor_dlkm`/vendor modules are
+compiled by the OEM with a specific clang **and kCFI** configuration. A kernel built with a different
+clang (e.g. the tree's prebuilt clang-14) and/or **CFI disabled** will "boot" but its modules fail to
+load (CFI type-hash / vermagic mismatch) and the device silently falls back to the other slot.
+
+The proven fix is to compile with a **modern real clang (e.g. Neutron clang-23)** but place a
+**version-faking wrapper** on `PATH` whose `--version` echoes the OEM's exact `clang version ...`
+string (read it from `adb shell cat /proc/version`, e.g. `Android (...) clang version 21.0.0 (...)`),
+and to enable **kCFI** (`CONFIG_CFI_CLANG=y`) + ThinLTO. This makes `mkcompile_h` embed a vermagic /
+build-env that matches the vendor modules. `build_oneplus_resukisu.sh` generates this wrapper
+automatically from the device's `/proc/version`.
 
 ```bash
 cd <workdir>/kernel_platform/common
-export PATH="$PWD/../prebuilts/clang/host/linux-x86/clang-*/bin:$PATH"
-export PATH="$PWD/../prebuilts/kernel-build-tools/linux-x86/bin:$PATH"
+# 1) real Neutron clang-23 behind a wrapper that fakes the OEM clang/LLD --version string
+export PATH="<workdir>/clang-wrappers:<workdir>/prebuilts/kernel-build-tools/linux-x86/bin:$PATH"
 export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
-export CROSS_COMPILE=aarch64-linux-gnu- LTO=thin
+export CROSS_COMPILE=aarch64-linux-gnu-
+export LD=ld.lld HOSTLD=ld.lld
+export CC=clang CXX=clang++ HOSTCC=gcc HOSTCXX=g++
+export KBUILD_BUILD_USER=build-user KBUILD_BUILD_HOST=build-host
+export LTO=thin
+make O=out ARCH=arm64 LLVM=1 gki_defconfig
+# 2) pin EXACT uname -r suffix (incl -dirty); drop AUTO so nothing is appended
+scripts/config --file out/.config --set-str LOCALVERSION "-g80a299579459-dirty"
+scripts/config --file out/.config -d LOCALVERSION_AUTO
+# 3) kCFI ON + ThinLTO (required to match OEM vendor modules)
+scripts/config --file out/.config -e CONFIG_CFI_CLANG
+scripts/config --file out/.config -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_FULL
+scripts/config --file out/.config -e LTO_CLANG_THIN
 # neutralize -dirty / scmversion (the script does this automatically):
 sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion
-make O=out ARCH=arm64 LLVM=1 gki_defconfig
-scripts/config --file out/.config --set-str LOCALVERSION "-ReSukiSU"
-scripts/config --file out/.config -d LOCALVERSION_AUTO
 make O=out -j"$(nproc)" Image
 ```
 
@@ -195,8 +222,9 @@ Output `Image` lands at `<workdir>/kernel_platform/common/out/arch/arm64/boot/Im
 
 When building locally you must stop `-dirty` / scmversion stamping. Local edits make
 `scripts/setlocalversion` append `-dirty`, flipping the version off `5.15.207`. `build_oneplus_resukisu.sh`
-neutralizes `setlocalversion` and pins `LOCALVERSION` so the banner stays exactly
-`5.15.207-ReSukiSU`. (When using the oplus wrapper instead, you would additionally need to disable
+neutralizes `setlocalversion` and pins `LOCALVERSION` to the exact `uname -r` suffix so the
+banner stays exactly `5.15.207-g80a299579459-dirty` (matches the device). (When using the oplus
+wrapper instead, you would additionally need to disable
 `check_defconfig` / KMI `ABI_DEFINITION` / `TRIM_NONLISTED_KMI` and strip `-Werror` — but this skill
 uses the direct-make flow, which avoids those.)
 
@@ -210,6 +238,10 @@ TWRP) or `ksud`. AK3 only swaps the kernel in `boot`, leaving `vendor_boot` (dtb
 Pull the **stock** `boot.img` (from an OTA `payload.bin`, or `adb pull` if rooted), unpack with
 `magiskboot`/`unmkbootimg`, replace `kernel`/`Image` with the built one, repack, then
 `fastboot flash boot boot.img`. Keep the stock `boot.img` for rollback.
+
+> ⚠️ **Do NOT use `fastboot boot <img>` to test.** On this bootloader it reports "Booting OKAY" but
+> then boots the slot's existing kernel, ignoring the temp image — there is no reliable RAM test.
+> Validate by flashing `boot_a` (keep `_b` as fallback) and checking `uname -r` after reboot.
 
 ### Stock image extraction (from OTA payload, for backup)
 
@@ -241,7 +273,7 @@ The manager installs its `ksud` into `/data/adb/ksud` on first boot after crowni
 ## Pitfalls (learned)
 
 - **[2026-08-01] The manifest tree is 5.15.180, not 5.15.207.** A build was completed and packed
-  before anyone checked the banner: it was `5.15.180-ReSukiSU` while the device ran `5.15.207`. Root
+  before anyone checked the banner: it was `5.15.180-<suffix>` (built for the wrong base version) while the device ran `5.15.207`. Root
   cause: `repo sync` of `oneplus_ace3_b.xml` lands on `oneplus/sm8550_b_16.0.0_ace_3` = **5.15.180**,
   and the build log's "up to date with origin/main" was mistaken for a successful checkout of
   5.15.207. **Never infer the kernel version from the manifest name or from build intent — read

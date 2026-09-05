@@ -5,25 +5,39 @@
 # SOURCE TREE LAYOUT (required): the OnePlus manifest tree
 #   <workdir>/kernel_platform/common        (GKI common tree)
 #   <workdir>/kernel_platform/prebuilts/... (prebuilt clang + kernel-build-tools)
-# The build itself is the WildKernels-style direct `make` flow (clang + thinLTO),
-# which avoids the brittle oplus CI wrapper and its out-of-CI assumptions.
+# Direct `make` flow (clang + ThinLTO + kCFI), avoiding the brittle oplus CI wrapper.
 #
-# *** CRITICAL — VERSION GATE ***
-# The built kernel version MUST equal the device's running kernel (e.g. 5.15.207).
-# The official Ace 3 manifest (oneplus_ace3_b.xml) yields 5.15.180 — a mismatch
-# makes every vendor_dlkm module refuse to load and the device WILL NOT BOOT.
-# Pass --target-version (or --device-serial to auto-detect from uname -r); the
-# script refuses to build when the tree version != target.
+# *** CRITICAL 1 — VERSION MUST MATCH THE DEVICE EXACTLY (INCLUDING -g<hash>-dirty) ***
+# The built kernel version MUST equal the device's `uname -r` (e.g.
+# 5.15.207-g80a299579459-dirty) INCLUDING the `-g<hash>` and `-dirty` suffix.
+# A mismatch makes every vendor_dlkm module refuse to load and the device WILL NOT
+# BOOT. The script auto-detects the exact string from the device and hard-pins it
+# (CONFIG_LOCALVERSION = the exact suffix, LOCALVERSION_AUTO=n) so the banner can
+# never drift. Do NOT use a vanity LOCALVERSION like "-ReSukiSU" — that produces
+# 5.15.207-ReSukiSU which does NOT match and will not boot.
+#
+# *** CRITICAL 2 — TOOLCHAIN / CFI MUST MATCH THE VENDOR MODULES ***
+# The device's vendor modules are built by the OEM with a specific clang + kCFI
+# configuration. A kernel built with a DIFFERENT clang (e.g. the tree's prebuilt
+# clang-14) and/or CFI disabled will "boot" but its modules fail to load (CFI
+# type-hash / vermagic mismatch) and it silently falls back to the other slot.
+# Fix: build with a modern real clang behind a *version-faking wrapper* that
+# reports the OEM's exact `clang version ...` string (so mkcompile_h embeds a
+# vermagic/version that matches the modules), and ENABLE kCFI
+# (CONFIG_CFI_CLANG=y). The proven real compiler for Ace 3 / Lunaris / stock
+# OnePlus Android 16 is Neutron clang-23 behind such a wrapper (OEM ROM string =
+# Android clang 21.0.0 r563880c). The REAL compiler version only needs to emit a
+# kCFI scheme compatible with the modules; clang-23 was verified working.
 #
 # Usage:
 #   bash build_oneplus_resukisu.sh \
 #       [--workdir $HOME/kernel-build] \
-#       [--target-version 5.15.207] \      # gate: tree must match this
-#       [--device-serial <serial>] \       # alt: auto-detect target from uname -r
+#       [--target-version 5.15.207-g80a299579459-dirty] \  # FULL uname -r; gate
+#       [--device-serial <serial>] \                        # alt: auto-detect target + clang str
+#       [--clang-real /path/to/clang] \                     # real compiler (exec'd by wrapper)
+#       [--clang-version-string "clang version 21.0.0 (...)"] \ # override OEM clang string
 #       [--sync --branch oneplus/sm8550 --manifest oneplus_ace3_b.xml] \
-#       [--hook manual]            # manual | susfs
-#       [--keep-opts]              # optional BBR/TTL/IPSET/NTSYNC patches
-#       [--no-reset]               # do not git-clean common before integrate
+#       [--hook manual|susfs] [--keep-opts] [--no-reset]
 set -euo pipefail
 
 WORKDIR="$HOME/kernel-build"
@@ -35,6 +49,9 @@ BRANCH=""
 MANIFEST=""
 TARGET_VERSION=""
 SERIAL=""
+CLANG_REAL=""
+CLANG_VERSION_STRING=""
+WRAPPER_DIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,6 +65,9 @@ while [ $# -gt 0 ]; do
     --manifest) MANIFEST="$2"; shift 2 ;;
     --target-version) TARGET_VERSION="$2"; shift 2 ;;
     --device-serial) SERIAL="$2"; shift 2 ;;
+    --clang-real) CLANG_REAL="$2"; shift 2 ;;
+    --clang-version-string) CLANG_VERSION_STRING="$2"; shift 2 ;;
+    --wrapper-dir) WRAPPER_DIR="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -58,6 +78,7 @@ AK3="$WORKDIR/AnyKernel3"
 OUT="$COMMON/out"
 AK3_REPO="https://github.com/osm0sis/AnyKernel3.git"
 LOG="$WORKDIR/ReSukiSU-build.log"
+WRAPPER_DIR="${WRAPPER_DIR:-$WORKDIR/clang-wrappers}"
 mkdir -p "$WORKDIR"
 exec > >(tee -a "$LOG") 2>&1
 
@@ -85,48 +106,92 @@ fi
 
 [ -d "$COMMON" ] || { echo "ERROR: $COMMON missing — sync the OnePlus GKI source first (or use --sync)"; exit 1; }
 
-# ---------- version gate ----------
+# ---------- version gate (compare BASE version X.Y.Z) ----------
 TREE_VER=$(awk '/^VERSION = /{v=$3} /^PATCHLEVEL = /{p=$3} /^SUBLEVEL = /{s=$3} END{print v"."p"."s}' "$COMMON/Makefile")
-echo "  tree kernel version : $TREE_VER"
+echo "  tree kernel base version : $TREE_VER"
 
+# auto-detect full uname -r from device when possible
 if [ -z "$TARGET_VERSION" ] && [ -n "$SERIAL" ]; then
   if command -v adb >/dev/null 2>&1 && $ADB devices 2>/dev/null | grep -q "device$"; then
-    TARGET_VERSION=$($ADB shell uname -r 2>/dev/null | tr -d '\r' | sed 's/-.*//') || true
+    TARGET_VERSION=$($ADB shell uname -r 2>/dev/null | tr -d '\r' | sed 's/[[:space:]].*//')
     echo "  auto target (device): $TARGET_VERSION"
   fi
 fi
 
 if [ -n "$TARGET_VERSION" ]; then
-  if [ "$TREE_VER" != "$TARGET_VERSION" ]; then
-    echo "ERROR: version gate FAILED — tree=$TREE_VER but target=$TARGET_VERSION"
-    echo "The device runs $TARGET_VERSION. A $TREE_VER kernel will NOT boot"
-    echo "(vendor_dlkm vermagic mismatch). Sync the correct source tree"
-    echo "(see references/oneplus_resukisu.md, 'Source tree selection')."
+  TARGET_BASE=$(echo "$TARGET_VERSION" | sed -E 's/-.*//')
+  if [ "$TREE_VER" != "$TARGET_BASE" ]; then
+    echo "ERROR: version gate FAILED — tree base=$TREE_VER but target base=$TARGET_BASE (full: $TARGET_VERSION)"
+    echo "The device runs $TARGET_VERSION. A $TREE_VER kernel will NOT boot (vendor_dlkm vermagic mismatch)."
+    echo "Sync the correct source tree (see references/oneplus_resukisu.md, 'Source tree selection')."
     exit 1
   fi
-  echo "  [OK] tree version matches target $TARGET_VERSION"
+  echo "  [OK] tree base version matches target $TARGET_VERSION"
 else
   echo "  [warn] no --target-version / --device-serial given — SKIPPING version gate."
-  echo "  You MUST confirm $TREE_VER equals the device's 'uname -r' before flashing."
+  echo "  You MUST confirm $TREE_VER equals the device's 'uname -r' base before flashing."
 fi
 
-# ---------- toolchain (auto-detect prebuilt clang) ----------
-CLANG=$(ls -d "$KP"/prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | head -1)/bin
-BTOOLS="$KP/prebuilts/kernel-build-tools/linux-x86/bin"
-[ -d "$CLANG" ] || { echo "ERROR: clang not found under $KP/prebuilts/clang"; exit 1; }
-[ -d "$BTOOLS" ] || { echo "ERROR: kernel-build-tools not found under $KP/prebuilts"; exit 1; }
+# ---------- toolchain: real clang + version-faking wrapper ----------
+# Real compiler (exec'd). Prefer --clang-real, else auto-detect a modern clang.
+if [ -z "$CLANG_REAL" ]; then
+  # prefer a Neutron / recent clang already on disk; fall back to system clang
+  CLANG_REAL=$(command -v clang-23 clang-22 clang-21 clang 2>/dev/null | head -1)
+fi
+[ -x "$CLANG_REAL" ] || { echo "ERROR: real clang not found (--clang-real)."; exit 1; }
+echo "  real clang : $($CLANG_REAL --version | head -1)"
 
-export PATH="$CLANG:$BTOOLS:$PATH"
+# OEM clang version string (faked by wrapper so vermagic/CFI-env matches modules)
+if [ -z "$CLANG_VERSION_STRING" ] && [ -n "$SERIAL" ]; then
+  if $ADB devices 2>/dev/null | grep -q "device$"; then
+    CLANG_VERSION_STRING=$($ADB shell cat /proc/version 2>/dev/null | grep -oE "clang version [^,]+" | head -1)
+    LLD_VERSION_STRING=$($ADB shell cat /proc/version 2>/dev/null | grep -oE "LLD [0-9.]+[^)]*\)" | head -1)
+  fi
+fi
+[ -n "$CLANG_VERSION_STRING" ] || { echo "ERROR: cannot determine OEM clang version string; pass --clang-version-string (from 'adb shell cat /proc/version')."; exit 1; }
+LLD_VERSION_STRING="${LLD_VERSION_STRING:-LLD 21.0.0}"
+echo "  faked clang : $CLANG_VERSION_STRING"
+echo "  faked lld   : $LLD_VERSION_STRING"
+
+mkdir -p "$WRAPPER_DIR"
+cat > "$WRAPPER_DIR/clang" <<EOF
+#!/bin/sh
+# Wrapper: real clang for compilation, but '--version'/'-v' return the OEM's
+# exact clang string so mkcompile_h embeds a vermagic that matches vendor modules.
+case " \$* " in
+  *" --version "*|*" -v "*|*" --version"|"--version "*)
+    echo "$CLANG_VERSION_STRING"
+    exit 0
+    ;;
+esac
+exec $CLANG_REAL "\$@"
+EOF
+cat > "$WRAPPER_DIR/ld.lld" <<EOF
+#!/bin/sh
+case " \$* " in
+  *" --version "*|*" -v "*|*" --version"|"--version "*)
+    echo "$LLD_VERSION_STRING"
+    exit 0
+    ;;
+esac
+exec $($CLANG_REAL --print-prog-name=ld.lld) "\$@"
+EOF
+chmod +x "$WRAPPER_DIR/clang" "$WRAPPER_DIR/ld.lld"
+echo "  wrappers   : $WRAPPER_DIR/clang , $WRAPPER_DIR/ld.lld"
+
+BTOOLS="$KP/prebuilts/kernel-build-tools/linux-x86/bin"
+[ -d "$BTOOLS" ] || { echo "ERROR: kernel-build-tools not found under $KP/prebuilts"; exit 1; }
+export PATH="$WRAPPER_DIR:$BTOOLS:$PATH"
 export ARCH=arm64 SUBARCH=arm64
 export LLVM=1 LLVM_IAS=1
 export CROSS_COMPILE=aarch64-linux-gnu-
 export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm
 export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-export PAHOLE="$BTOOLS/pahole"
-export CC="clang" CXX="clang++" HOSTCC="clang" HOSTCXX="clang++"
+export CC=clang CXX=clang++ HOSTCC=gcc HOSTCXX=g++
 export KCFLAGS="-no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument -D__ANDROID_COMMON_KERNEL__"
 export KCPPFLAGS=""
-# thin LTO is mandatory on <24GB hosts; default to it.
+export KBUILD_BUILD_USER=build-user KBUILD_BUILD_HOST=build-host
+# ThinLTO is mandatory on <24GB hosts; default to it.
 export LTO=thin
 
 # ---------- (optional) reset common to a clean synced state ----------
@@ -149,8 +214,6 @@ curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup
 echo "==> [2] enable ReSukiSU in gki_defconfig"
 DEF="$COMMON/arch/arm64/configs/gki_defconfig"
 grep -q "CONFIG_KSU=y" "$DEF" || echo "CONFIG_KSU=y" >> "$DEF"
-# Default GKI syscall/tracepoint hook (works on GKI 2.0, no core-kernel patches).
-# Manual Hook mode needs hand-applied ksu_handle_* patches — we don't apply those.
 sed -i '/CONFIG_KSU_MANUAL_HOOK/d' "$DEF"
 if [ "$HOOK" = "susfs" ]; then
   grep -q "CONFIG_KSU_SUSFS=y" "$DEF" || echo "CONFIG_KSU_SUSFS=y" >> "$DEF"
@@ -175,31 +238,28 @@ EOF
 fi
 
 # ---------- 4. build ----------
-echo "==> [4] build kernel (clang + thinLTO)"
+echo "==> [4] build kernel (clang wrapper + ThinLTO + kCFI)"
 cd "$COMMON"
-: > .scmversion
-# ld-wrapper: force thinlto parallelism
-cat > "$COMMON/ld-wrapper" <<'EOF'
-#!/bin/bash
-ld.lld "$@" --thinlto-jobs=$(nproc --all)
-EOF
-chmod +x "$COMMON/ld-wrapper"
-export KBUILD_BUILD_USER=kernel
-export KBUILD_BUILD_HOST=kleaf
-export KBUILD_BUILD_VERSION=1
-mkdir -p "$OUT"
-make LD="$COMMON/ld-wrapper" HOSTLD="$COMMON/ld-wrapper" O="$OUT" gki_defconfig
-scripts/config --file "$OUT/.config" --set-str LOCALVERSION "-ReSukiSU"
-scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO || true
+# vermagic = EXACT device uname -r suffix (incl -g<hash>-dirty); AUTO off
+SUFFIX=""
+if [ -n "$TARGET_VERSION" ]; then
+  SUFFIX="-${TARGET_VERSION#*-}"   # keep everything after the first '-' (e.g. -g80a299579459-dirty)
+fi
+make O="$OUT" ARCH=arm64 LLVM=1 gki_defconfig
+if [ -n "$SUFFIX" ]; then
+  scripts/config --file "$OUT/.config" --set-str LOCALVERSION "$SUFFIX"
+else
+  scripts/config --file "$OUT/.config" --set-str LOCALVERSION ""
+fi
+scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO
 sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion
-scripts/config --file "$OUT/.config" -e CC_OPTIMIZE_FOR_PERFORMANCE -d CC_OPTIMIZE_FOR_PERFORMANCE_O3
-scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL
+# kCFI ON + ThinLTO (required to match the OEM's clang/CFI vendor modules)
+scripts/config --file "$OUT/.config" -e CONFIG_CFI_CLANG
+scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_FULL
 scripts/config --file "$OUT/.config" -e LTO_CLANG_THIN
-scripts/config --file "$OUT/.config" -d LTO_CLANG_FULL
-# confirm utsrelease before linking
 UTS=$(grep UTS_RELEASE "$OUT/include/generated/utsrelease.h" 2>/dev/null | tr -d '"#' | awk '{print $3}')
 echo "  utsrelease: ${UTS:-<unknown>}"
-make LD="$COMMON/ld-wrapper" HOSTLD="$COMMON/ld-wrapper" O="$OUT" -j"$(nproc)" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" Image 2>&1 | tee "$WORKDIR/build-run.log"
+make O="$OUT" -j"$(nproc)" KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" Image 2>&1 | tee "$WORKDIR/build-run.log"
 
 # ---------- 5. package ----------
 echo "==> [5] locate Image + pack AnyKernel3"
@@ -208,9 +268,13 @@ if [ ! -f "$IMAGE" ]; then
   echo "ERROR: build did not produce $IMAGE. Inspect $WORKDIR/build-run.log"
   exit 1
 fi
-# banner check before packing
 BANNER=$(strings -a "$IMAGE" | grep -m1 "Linux version" || true)
 echo "  built banner: $BANNER"
+# banner MUST equal device uname -r exactly
+if [ -n "$TARGET_VERSION" ]; then
+  echo "$BANNER" | grep -q "$TARGET_VERSION" || { echo "ERROR: banner vermagic '$TARGET_VERSION' mismatch — abort (modules will not load)."; exit 1; }
+  echo "  [OK] banner vermagic matches device uname -r"
+fi
 cp "$IMAGE" "$WORKDIR/Image_ReSukiSU"
 echo "    Image: $WORKDIR/Image_ReSukiSU ($(du -h "$WORKDIR/Image_ReSukiSU" | cut -f1))"
 
@@ -227,6 +291,7 @@ echo "   Flashable AK3 : $WORKDIR/ReSukiSU-Ace3.zip"
 echo "   Raw Image     : $WORKDIR/Image_ReSukiSU"
 echo "   Built banner  : $BANNER"
 echo "============================================================"
-echo "Compare the banner above to 'adb shell uname -r' BEFORE flashing."
-echo "Flash ReSukiSU-Ace3.zip via custom recovery (OrangeFox/TWRP) or ksud."
+echo "The banner above MUST equal 'adb shell uname -r' exactly (incl -dirty)."
+echo "Flash ReSukiSU-Ace3.zip via custom recovery (OrangeFox/TWRP) or ksud, or"
+echo "repack into boot.img and 'fastboot flash boot_a' (keep _b as fallback)."
 echo "Then install a compatible manager (e.g. Official KernelSU me.weishu.kernelsu) and open it once."
